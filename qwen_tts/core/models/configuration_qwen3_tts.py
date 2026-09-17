@@ -382,6 +382,7 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         rms_norm_eps=0.000001,
         use_cache=True,
         tie_word_embeddings=False,
+        pad_token_id=None,
         rope_theta=10000,
         rope_scaling=None,
         attention_bias=False,
@@ -404,6 +405,7 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
     ):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            pad_token_id=pad_token_id,
             **kwargs,
         )
         self.vocab_size = vocab_size
