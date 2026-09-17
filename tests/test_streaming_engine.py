@@ -1,8 +1,12 @@
 from threading import RLock
 
 import torch
+from torch import nn
 
-from qwen_tts.streaming.engine import Qwen3TTSContinuousEngine
+from qwen_tts.streaming.engine import (
+    Qwen3TTSContinuousEngine,
+    _configure_audio_decoder_dtype,
+)
 
 
 class _FakeQwenModel:
@@ -25,6 +29,17 @@ class _FakeAudioDecoder:
 
     def create_request(self, request_id: str) -> None:
         self.created.append(request_id)
+
+
+def test_audio_decoder_uses_fp32_without_changing_other_modules() -> None:
+    talker = nn.Linear(2, 2).to(dtype=torch.bfloat16)
+    decoder = nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+    configured = _configure_audio_decoder_dtype(decoder, torch.float32)
+
+    assert configured is decoder
+    assert decoder.weight.dtype == torch.float32
+    assert talker.weight.dtype == torch.bfloat16
 
 
 def test_create_request_initializes_matching_audio_state() -> None:

@@ -17,6 +17,16 @@ from .text import StableTextTokenizer
 from .trace import StreamingTraceEvent, TraceCallback
 
 
+def _configure_audio_decoder_dtype(
+    decoder: torch.nn.Module,
+    dtype: torch.dtype | None,
+) -> torch.nn.Module:
+    """Keep the numerically sensitive codec-to-wave decoder out of BF16."""
+    if dtype is not None:
+        decoder.to(dtype=dtype)
+    return decoder
+
+
 @dataclass
 class _PendingInput:
     tokenizer: StableTextTokenizer
@@ -58,6 +68,7 @@ class Qwen3TTSContinuousEngine:
         audio_initial_chunk_frames: int = 4,
         audio_steady_chunk_frames: int = 25,
         audio_idle_flush_ms: float = 100.0,
+        audio_decoder_dtype: torch.dtype | None = torch.float32,
         enable_cuda_graphs: bool = True,
         cuda_graph_max_sequence_length: int = 2_048,
         trace_callback: TraceCallback | None = None,
@@ -74,8 +85,12 @@ class Qwen3TTSContinuousEngine:
             speech_tokenizer = qwen_model.model.speech_tokenizer
             if speech_tokenizer is None or not hasattr(speech_tokenizer.model, "decoder"):
                 raise ValueError("Qwen 12Hz speech tokenizer decoder is not loaded")
-            self.audio_decoder = QwenStreamingAudioDecoder(
+            decoder = _configure_audio_decoder_dtype(
                 speech_tokenizer.model.decoder,
+                audio_decoder_dtype,
+            )
+            self.audio_decoder = QwenStreamingAudioDecoder(
+                decoder,
                 sample_rate=speech_tokenizer.model.get_output_sample_rate(),
                 chunk_callback=audio_callback,
                 request_finished_callback=audio_finished_callback,
