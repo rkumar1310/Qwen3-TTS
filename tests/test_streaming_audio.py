@@ -13,12 +13,17 @@ class FakeDecoder(nn.Module):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
         self.batch_sizes = []
+        self.frame_lengths = []
 
     def batched_chunked_decode(self, codes, lengths, caches, *, max_batch_size):
         self.batch_sizes.append(int(codes.shape[0]))
-        for cache in caches:
-            cache["frames"] = cache.get("frames", 0) + 1
-        return [torch.full((1, 1, 4), float(row)) for row in range(codes.shape[0])]
+        self.frame_lengths.append(list(lengths))
+        for cache, length in zip(caches, lengths, strict=True):
+            cache["frames"] = cache.get("frames", 0) + length
+        return [
+            torch.full((1, 1, length * 4), float(row))
+            for row, length in enumerate(lengths)
+        ]
 
 
 def test_audio_decoder_microbatches_requests_and_finishes_after_drain():
@@ -56,3 +61,34 @@ def test_audio_decoder_microbatches_requests_and_finishes_after_drain():
     assert all(chunk.sample_rate == 24_000 for chunk in chunks)
     assert set(finished) == {"a", "b"}
 
+
+def test_audio_decoder_buffers_a_small_first_chunk_then_larger_steady_chunks():
+    decoder = FakeDecoder()
+    chunks = []
+    done = Event()
+    worker = QwenStreamingAudioDecoder(
+        decoder,
+        sample_rate=24_000,
+        chunk_callback=lambda chunk: (chunks.append(chunk), done.set() if len(chunks) == 2 else None),
+        initial_chunk_frames=4,
+        steady_chunk_frames=8,
+    )
+    worker.create_request("turn")
+    worker.start()
+    now = time.perf_counter()
+    for sequence in range(12):
+        worker.submit_frame(
+            GeneratedCodecFrame(
+                "turn",
+                torch.tensor([sequence, sequence + 1]),
+                now + sequence / 12,
+                sequence,
+            )
+        )
+
+    assert done.wait(2)
+    worker.finish_request("turn")
+    worker.stop()
+
+    assert decoder.frame_lengths == [[4], [8]]
+    assert [chunk.pcm.numel() for chunk in chunks] == [16, 32]

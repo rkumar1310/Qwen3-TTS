@@ -36,6 +36,8 @@ class QwenStreamingAudioDecoder:
         error_callback: Callable[[str, Exception], None] | None = None,
         max_batch_size: int = 16,
         microbatch_wait_ms: float = 1.0,
+        initial_chunk_frames: int = 4,
+        steady_chunk_frames: int = 8,
         trace_callback: TraceCallback | None = None,
     ) -> None:
         self.decoder = decoder
@@ -45,6 +47,11 @@ class QwenStreamingAudioDecoder:
         self.error_callback = error_callback
         self.max_batch_size = int(max_batch_size)
         self.microbatch_wait_seconds = max(0.0, microbatch_wait_ms / 1000.0)
+        self.initial_chunk_frames = max(1, int(initial_chunk_frames))
+        self.steady_chunk_frames = max(
+            self.initial_chunk_frames,
+            int(steady_chunk_frames),
+        )
         self.trace_callback = trace_callback
         self._queue: deque[GeneratedCodecFrame] = deque()
         self._caches: dict[str, dict] = {}
@@ -119,25 +126,38 @@ class QwenStreamingAudioDecoder:
                     return
                 if self._queue and self.microbatch_wait_seconds:
                     self._condition.wait(timeout=self.microbatch_wait_seconds)
-                frames = self._take_batch_locked()
+                frame_groups = self._take_batch_locked()
 
-            if not frames:
+            if not frame_groups:
                 with self._condition:
                     self._finish_drained_requests_locked()
+                    if self._queue and not self._stopping:
+                        self._condition.wait(timeout=0.05)
                 continue
-            request_ids = [frame.request_id for frame in frames]
+            request_ids = [frames[0].request_id for frames in frame_groups]
             try:
                 batch_started_at = time.perf_counter()
                 device = next(self.decoder.parameters()).device
-                codes = torch.stack([frame.codes.to(device=device) for frame in frames], dim=0)
-                if codes.ndim == 2:
-                    codes = codes.unsqueeze(-1)
+                lengths = [len(frames) for frames in frame_groups]
+                code_groups = [
+                    torch.stack([frame.codes.to(device=device) for frame in frames], dim=-1)
+                    for frames in frame_groups
+                ]
+                codes = torch.zeros(
+                    len(code_groups),
+                    code_groups[0].shape[0],
+                    max(lengths),
+                    dtype=code_groups[0].dtype,
+                    device=device,
+                )
+                for row, request_codes in enumerate(code_groups):
+                    codes[row, :, : request_codes.shape[-1]].copy_(request_codes)
                 caches = [self._caches[request_id] for request_id in request_ids]
                 decoder_started_at = time.perf_counter()
                 with torch.inference_mode():
                     waveforms = self.decoder.batched_chunked_decode(
                         codes,
-                        [int(codes.shape[-1])] * len(frames),
+                        lengths,
                         caches,
                         max_batch_size=self.max_batch_size,
                     )
@@ -147,32 +167,37 @@ class QwenStreamingAudioDecoder:
                     for waveform in waveforms
                 ]
                 decoded_at = time.perf_counter()
-                for frame, pcm in zip(frames, cpu_waveforms, strict=True):
-                    sequence = self._sequences.get(frame.request_id, 0)
+                for frames, pcm in zip(frame_groups, cpu_waveforms, strict=True):
+                    first_frame = frames[0]
+                    last_frame = frames[-1]
+                    sequence = self._sequences.get(first_frame.request_id, 0)
                     self._trace(
-                        frame.request_id,
+                        first_frame.request_id,
                         "audio.decode",
                         requestIds=request_ids,
-                        batchSize=len(frames),
+                        batchSize=len(frame_groups),
+                        codecFrames=len(frames),
                         decoderMs=(decoder_finished_at - decoder_started_at) * 1_000,
                         gpuToCpuMs=(decoded_at - decoder_finished_at) * 1_000,
                         totalMs=(decoded_at - batch_started_at) * 1_000,
                     )
                     self._trace(
-                        frame.request_id,
+                        first_frame.request_id,
                         "pcm.chunk",
                         sequence=sequence,
                         samples=int(pcm.numel()),
                         sampleRate=self.sample_rate,
-                        codecToPcmMs=(decoded_at - frame.generated_at) * 1_000,
+                        codecFrames=len(frames),
+                        bufferMs=(last_frame.generated_at - first_frame.generated_at) * 1_000,
+                        codecToPcmMs=(decoded_at - first_frame.generated_at) * 1_000,
                     )
-                    self._sequences[frame.request_id] = sequence + 1
+                    self._sequences[first_frame.request_id] = sequence + 1
                     self.chunk_callback(
                         GeneratedAudioChunk(
-                            request_id=frame.request_id,
+                            request_id=first_frame.request_id,
                             pcm=pcm,
                             sample_rate=self.sample_rate,
-                            generated_at=frame.generated_at,
+                            generated_at=first_frame.generated_at,
                             decoded_at=decoded_at,
                         )
                     )
@@ -185,21 +210,49 @@ class QwenStreamingAudioDecoder:
                 with self._condition:
                     self._finish_drained_requests_locked()
 
-    def _take_batch_locked(self) -> list[GeneratedCodecFrame]:
-        frames: list[GeneratedCodecFrame] = []
-        selected_request_ids: set[str] = set()
-        deferred: deque[GeneratedCodecFrame] = deque()
-        while self._queue and len(frames) < self.max_batch_size:
-            frame = self._queue.popleft()
+    def _take_batch_locked(self) -> list[list[GeneratedCodecFrame]]:
+        """Take several frames per request to amortize the expensive vocoder call."""
+        available: dict[str, int] = {}
+        request_order: list[str] = []
+        filtered: deque[GeneratedCodecFrame] = deque()
+        for frame in self._queue:
             if frame.request_id in self._cancelled or frame.request_id not in self._caches:
                 continue
-            if frame.request_id in selected_request_ids:
+            filtered.append(frame)
+            if frame.request_id not in available:
+                available[frame.request_id] = 0
+                request_order.append(frame.request_id)
+            available[frame.request_id] += 1
+        self._queue = filtered
+
+        selected_counts: dict[str, int] = {}
+        for request_id in request_order:
+            if len(selected_counts) >= self.max_batch_size:
+                break
+            target = (
+                self.initial_chunk_frames
+                if self._sequences.get(request_id, 0) == 0
+                else self.steady_chunk_frames
+            )
+            count = available[request_id]
+            if count >= target:
+                selected_counts[request_id] = target
+            elif (request_id in self._closing or self._stopping) and count:
+                selected_counts[request_id] = count
+
+        if not selected_counts:
+            return []
+        groups = {request_id: [] for request_id in selected_counts}
+        deferred: deque[GeneratedCodecFrame] = deque()
+        while self._queue:
+            frame = self._queue.popleft()
+            group = groups.get(frame.request_id)
+            if group is not None and len(group) < selected_counts[frame.request_id]:
+                group.append(frame)
+            else:
                 deferred.append(frame)
-                continue
-            frames.append(frame)
-            selected_request_ids.add(frame.request_id)
-        self._queue.extendleft(reversed(deferred))
-        return frames
+        self._queue = deferred
+        return [groups[request_id] for request_id in request_order if request_id in groups]
 
     def _finish_drained_requests_locked(self) -> None:
         queued_request_ids = {frame.request_id for frame in self._queue}

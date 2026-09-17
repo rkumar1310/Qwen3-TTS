@@ -21,6 +21,7 @@ from typing import Callable
 
 import torch
 
+from .cuda_graphs import PredictorCudaGraph, TalkerCudaGraph
 from .model import GeneratedCodecFrame, PreparedStreamingPrompt
 from .requests import StreamConditionKind, StreamingRequestRegistry
 from .trace import StreamingTraceEvent, TraceCallback
@@ -77,6 +78,7 @@ class _NativeRequest:
     generator: torch.Generator
     status: NativeRequestStatus = NativeRequestStatus.PREFILLING
     past_key_values: object | None = None
+    cache_length: int = 0
     past_hidden: torch.Tensor | None = None
     next_token: int | None = None
     generated_tokens: list[int] = field(default_factory=list)
@@ -86,6 +88,11 @@ class _NativeRequest:
 
 def _cache_length(cache: object) -> int:
     return int(cache.get_seq_length())
+
+
+def _request_cache_length(request: _NativeRequest) -> int:
+    """Return the logical length even while KV state lives in a static graph."""
+    return request.cache_length or _cache_length(request.past_key_values)
 
 
 def _batch_caches(caches: list[object]) -> object:
@@ -158,7 +165,14 @@ def _slice_cache(cache: object, row: int) -> object:
 class NativeQwenTalkerExecutor:
     """Correct Qwen recurrent inference with request-local sampling state."""
 
-    def __init__(self, talker) -> None:
+    def __init__(
+        self,
+        talker,
+        *,
+        subtalker_sampling: NativeSamplingConfig | None = None,
+        enable_cuda_graphs: bool = True,
+        cuda_graph_max_sequence_length: int = 2_048,
+    ) -> None:
         self.talker = talker
         self.config = talker.config
         self.eos_token_id = int(self.config.codec_eos_token_id)
@@ -173,10 +187,39 @@ class NativeQwenTalkerExecutor:
         )
         self.last_prefill_metrics: dict[str, float] = {}
         self.last_decode_metrics: dict[str, float] = {}
+        self.predictor_graph: PredictorCudaGraph | None = None
+        self.talker_graph: TalkerCudaGraph | None = None
+        self.graph_owner: _NativeRequest | None = None
+        self.cuda_graph_error: str | None = None
+        graph_sampling = subtalker_sampling or NativeSamplingConfig()
+        if enable_cuda_graphs and talker.device.type == "cuda":
+            try:
+                dtype = next(talker.parameters()).dtype
+                self.predictor_graph = PredictorCudaGraph(
+                    talker.code_predictor,
+                    talker_hidden_size=int(talker.config.hidden_size),
+                    dtype=dtype,
+                    do_sample=graph_sampling.do_sample,
+                    top_k=graph_sampling.top_k,
+                    top_p=graph_sampling.top_p,
+                    temperature=graph_sampling.temperature,
+                )
+                self.talker_graph = TalkerCudaGraph(
+                    talker.model,
+                    dtype=dtype,
+                    max_sequence_length=cuda_graph_max_sequence_length,
+                )
+                self.predictor_graph.capture()
+                self.talker_graph.capture()
+            except Exception as error:
+                self.predictor_graph = None
+                self.talker_graph = None
+                self.cuda_graph_error = str(error)
 
     def prefill(self, requests: list[_NativeRequest]) -> None:
         if not requests:
             return
+        self.deactivate_cuda_graph()
         prompt_length = requests[0].prompt.length
         if any(request.prompt.length != prompt_length for request in requests):
             raise ValueError("prefill batch contains different prompt lengths")
@@ -209,6 +252,7 @@ class NativeQwenTalkerExecutor:
         cache_started_at = time.perf_counter()
         for row, request in enumerate(requests):
             request.past_key_values = _slice_cache(outputs.past_key_values, row)
+            request.cache_length = _cache_length(request.past_key_values)
             request.past_hidden = outputs.past_hidden[row : row + 1]
             token = self._choose_token(
                 logits[row : row + 1],
@@ -235,8 +279,18 @@ class NativeQwenTalkerExecutor:
             return []
         if len(requests) != len(conditions):
             raise ValueError("requests and text conditions must have equal length")
-        past_length = _cache_length(requests[0].past_key_values)
-        if any(_cache_length(request.past_key_values) != past_length for request in requests):
+        if (
+            len(requests) == 1
+            and self.predictor_graph is not None
+            and self.talker_graph is not None
+            and requests[0].subtalker_sampling.do_sample
+            and _request_cache_length(requests[0]) < self.talker_graph.max_sequence_length
+        ):
+            return self._decode_with_cuda_graph(requests[0], conditions[0])
+
+        self.deactivate_cuda_graph()
+        past_length = _request_cache_length(requests[0])
+        if any(_request_cache_length(request) != past_length for request in requests):
             raise ValueError("decode batch contains different cache lengths")
         if any(request.next_token is None or request.past_hidden is None for request in requests):
             raise RuntimeError("decode request was not prefetched")
@@ -306,6 +360,7 @@ class NativeQwenTalkerExecutor:
         frames: list[GeneratedCodecFrame] = []
         for row, request in enumerate(requests):
             request.past_key_values = _slice_cache(outputs.past_key_values, row)
+            request.cache_length = past_length + 1
             request.past_hidden = outputs.last_hidden_state[row : row + 1, -1:, :]
             frames.append(
                 GeneratedCodecFrame(
@@ -332,6 +387,98 @@ class NativeQwenTalkerExecutor:
             "talkerMs": (finished_at - talker_started_at) * 1_000,
         }
         return frames
+
+    def _decode_with_cuda_graph(
+        self,
+        request: _NativeRequest,
+        condition: torch.Tensor,
+    ) -> list[GeneratedCodecFrame]:
+        """Run the exact Qwen predictor and Talker modules from fixed GPU buffers."""
+        if self.predictor_graph is None or self.talker_graph is None:
+            raise RuntimeError("CUDA graph executor is unavailable")
+        if request.next_token is None or request.past_hidden is None:
+            raise RuntimeError("decode request was not prefetched")
+        past_length = _request_cache_length(request)
+        if past_length >= self.talker_graph.max_sequence_length:
+            self.deactivate_cuda_graph()
+            raise RuntimeError("request is too long for the Talker CUDA graph")
+        if self.graph_owner is not request:
+            self.deactivate_cuda_graph()
+            loaded_length = self.talker_graph.load_dynamic_cache(request.past_key_values)
+            if loaded_length != past_length:
+                raise RuntimeError(
+                    f"Talker cache length mismatch: {loaded_length} != {past_length}"
+                )
+            self.graph_owner = request
+
+        started_at = time.perf_counter()
+        main_tokens = torch.tensor(
+            [[request.next_token]],
+            dtype=torch.long,
+            device=self.talker.device,
+        )
+        first_codebook_hidden = self.talker.get_input_embeddings()(main_tokens)
+        predictor_started_at = time.perf_counter()
+        predictor_sequences = self.predictor_graph.run(
+            torch.cat([request.past_hidden, first_codebook_hidden], dim=1)
+        )
+        predictor_finished_at = time.perf_counter()
+        codec_codes = torch.cat([main_tokens, predictor_sequences], dim=1)
+        codec_embeddings = [first_codebook_hidden]
+        codec_embeddings.extend(
+            self.talker.code_predictor.get_input_embeddings()[index](
+                predictor_sequences[:, index : index + 1]
+            )
+            for index in range(self.config.num_code_groups - 1)
+        )
+        inputs_embeds = torch.cat(codec_embeddings, dim=1).sum(dim=1, keepdim=True)
+        inputs_embeds = inputs_embeds + condition
+        talker_started_at = time.perf_counter()
+        hidden = self.talker_graph.run(inputs_embeds, position=past_length)
+        logits = self.talker.codec_head(hidden)
+        generated_at = time.perf_counter()
+        frame = GeneratedCodecFrame(
+            request_id=request.request_id,
+            codes=codec_codes[0].detach(),
+            generated_at=generated_at,
+            sequence_index=len(request.generated_tokens) - 1,
+        )
+        request.past_hidden = hidden.clone()
+        request.cache_length = past_length + 1
+        token = self._choose_token(
+            logits,
+            request,
+            request.sampling,
+            history=request.generated_tokens,
+            enforce_minimum=True,
+        )
+        request.next_token = token
+        request.generated_tokens.append(token)
+        finished_at = time.perf_counter()
+        self.last_decode_metrics = {
+            "totalMs": (finished_at - started_at) * 1_000,
+            "predictorMs": (predictor_finished_at - predictor_started_at) * 1_000,
+            "cacheMs": 0.0,
+            "talkerMs": (finished_at - talker_started_at) * 1_000,
+            "cudaGraph": True,
+        }
+        return [frame]
+
+    def deactivate_cuda_graph(self) -> None:
+        """Copy the graph-owned KV state back before using eager batching."""
+        if self.graph_owner is None or self.talker_graph is None:
+            return
+        self.talker_graph.save_dynamic_cache(
+            self.graph_owner.past_key_values,
+            self.graph_owner.cache_length,
+        )
+        self.graph_owner = None
+
+    def release_request(self, request: _NativeRequest) -> None:
+        if self.graph_owner is request:
+            self.graph_owner = None
+            if self.talker_graph is not None:
+                self.talker_graph.static_cache.reset()
 
     def _decode_with_official_talker(
         self,
@@ -383,6 +530,7 @@ class NativeQwenTalkerExecutor:
         frames: list[GeneratedCodecFrame] = []
         for row, request in enumerate(requests):
             request.past_key_values = _slice_cache(outputs.past_key_values, row)
+            request.cache_length = past_length + 1
             request.past_hidden = outputs.past_hidden[row : row + 1]
             frames.append(
                 GeneratedCodecFrame(
@@ -533,9 +681,16 @@ class NativeContinuousBatchingManager:
         subtalker_sampling: NativeSamplingConfig,
         frame_callback: Callable[[GeneratedCodecFrame], None] | None = None,
         trace_callback: TraceCallback | None = None,
+        enable_cuda_graphs: bool = True,
+        cuda_graph_max_sequence_length: int = 2_048,
     ) -> None:
         self.registry = registry
-        self.executor = NativeQwenTalkerExecutor(talker)
+        self.executor = NativeQwenTalkerExecutor(
+            talker,
+            subtalker_sampling=subtalker_sampling,
+            enable_cuda_graphs=enable_cuda_graphs,
+            cuda_graph_max_sequence_length=cuda_graph_max_sequence_length,
+        )
         self.max_requests_per_batch = max(1, int(max_requests_per_batch))
         self.default_sampling = sampling
         self.default_subtalker_sampling = subtalker_sampling
@@ -612,13 +767,16 @@ class NativeContinuousBatchingManager:
             request = self._requests.get(request_id)
             if request is None or request.status in _TERMINAL_STATUSES:
                 return
+            self.executor.release_request(request)
             self._set_status(request, NativeRequestStatus.CANCELLED)
             self._publish_locked(request)
             self._condition.notify_all()
 
     def release_request(self, request_id: str) -> None:
         with self._condition:
-            self._requests.pop(request_id, None)
+            request = self._requests.pop(request_id, None)
+            if request is not None:
+                self.executor.release_request(request)
             self._results.pop(request_id, None)
 
     def get_result(self, request_id: str, timeout: float | None = None) -> NativeGenerationResult | None:
@@ -699,12 +857,12 @@ class NativeContinuousBatchingManager:
             candidates,
             key=lambda request: (request.last_scheduled_order, request.created_at),
         )
-        length = _cache_length(anchor.past_key_values)
+        length = _request_cache_length(anchor)
         selected = sorted(
             (
                 request
                 for request in candidates
-                if _cache_length(request.past_key_values) == length
+                if _request_cache_length(request) == length
             ),
             key=lambda request: (request.last_scheduled_order, request.created_at),
         )[: self.max_requests_per_batch]
@@ -788,7 +946,7 @@ class NativeContinuousBatchingManager:
                     frame.request_id,
                     "codec.frame",
                     sequence=frame.sequence_index,
-                    codes=[int(code) for code in frame.codes.tolist()],
+                    codeCount=int(frame.codes.numel()),
                 )
             if self.frame_callback is not None:
                 for frame in frames:
@@ -800,6 +958,7 @@ class NativeContinuousBatchingManager:
                     reached_eos = request.next_token == self.executor.eos_token_id
                     reached_limit = len(request.generated_tokens) >= request.max_new_tokens
                     if reached_eos or reached_limit:
+                        self.executor.release_request(request)
                         self._set_status(request, NativeRequestStatus.COMPLETED)
                         self._publish_locked(request)
                     elif self.registry.can_decode(request.request_id):
@@ -814,6 +973,7 @@ class NativeContinuousBatchingManager:
         with self._condition:
             for request in requests:
                 if request.status not in _TERMINAL_STATUSES:
+                    self.executor.release_request(request)
                     self._set_status(request, NativeRequestStatus.FAILED, error=str(error))
                     self._publish_locked(request, error=str(error))
             self._condition.notify_all()

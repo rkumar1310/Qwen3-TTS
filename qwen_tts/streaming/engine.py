@@ -55,6 +55,10 @@ class Qwen3TTSContinuousEngine:
         audio_finished_callback=None,
         audio_error_callback=None,
         audio_microbatch_wait_ms: float = 1.0,
+        audio_initial_chunk_frames: int = 4,
+        audio_steady_chunk_frames: int = 8,
+        enable_cuda_graphs: bool = True,
+        cuda_graph_max_sequence_length: int = 2_048,
         trace_callback: TraceCallback | None = None,
     ) -> None:
         if qwen_model.model.tts_model_type != "custom_voice":
@@ -77,6 +81,8 @@ class Qwen3TTSContinuousEngine:
                 error_callback=audio_error_callback,
                 max_batch_size=max_requests_per_batch,
                 microbatch_wait_ms=audio_microbatch_wait_ms,
+                initial_chunk_frames=audio_initial_chunk_frames,
+                steady_chunk_frames=audio_steady_chunk_frames,
                 trace_callback=trace_callback,
             )
 
@@ -106,6 +112,8 @@ class Qwen3TTSContinuousEngine:
             ),
             frame_callback=handle_frame,
             trace_callback=trace_callback,
+            enable_cuda_graphs=enable_cuda_graphs,
+            cuda_graph_max_sequence_length=cuda_graph_max_sequence_length,
         )
         # Kept in the signature so callers can roll between the old experiment
         # and the native scheduler without changing their configuration.
