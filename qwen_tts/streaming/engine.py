@@ -172,12 +172,12 @@ class Qwen3TTSContinuousEngine:
                 role_token_ids=role_ids,
                 max_new_tokens=max_new_tokens,
             )
+            if self.audio_decoder is not None:
+                self.audio_decoder.create_request(request_id)
 
     def is_submitted(self, request_id: str) -> bool:
         with self._lock:
             return self._get(request_id).submitted
-            if self.audio_decoder is not None:
-                self.audio_decoder.create_request(request_id)
 
     def append_text(self, request_id: str, delta: str) -> None:
         with self._lock:
