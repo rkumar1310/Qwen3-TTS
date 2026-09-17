@@ -164,23 +164,31 @@ class NativeQwenTalkerExecutor:
             raise ValueError("prefill batch contains different prompt lengths")
         batch_size = len(requests)
         embeddings = torch.cat([request.prompt.embeddings for request in requests], dim=0)
-        position_ids = torch.arange(prompt_length, device=self.talker.device)
-        position_ids = position_ids.view(1, 1, -1).expand(3, batch_size, -1)
-        outputs = self.talker.model(
+        outputs = self.talker(
             inputs_embeds=embeddings,
             attention_mask=torch.ones(
                 (batch_size, prompt_length),
                 dtype=torch.long,
                 device=self.talker.device,
             ),
-            position_ids=position_ids,
             cache_position=torch.arange(prompt_length, device=self.talker.device),
             use_cache=True,
+            output_hidden_states=True,
+            trailing_text_hidden=torch.cat(
+                [request.prompt.text_padding_embedding for request in requests], dim=0
+            ),
+            tts_pad_embed=torch.cat(
+                [request.prompt.text_padding_embedding for request in requests], dim=0
+            ),
+            subtalker_dosample=False,
+            subtalker_top_k=50,
+            subtalker_top_p=1.0,
+            subtalker_temperature=0.9,
         )
-        logits = self.talker.codec_head(outputs.last_hidden_state[:, -1:, :])
+        logits = outputs.logits
         for row, request in enumerate(requests):
             request.past_key_values = _slice_cache(outputs.past_key_values, row)
-            request.past_hidden = outputs.last_hidden_state[row : row + 1, -1:, :]
+            request.past_hidden = outputs.past_hidden[row : row + 1]
             token = self._choose_token(
                 logits[row : row + 1],
                 request,
@@ -211,6 +219,14 @@ class NativeQwenTalkerExecutor:
             dtype=torch.long,
             device=self.talker.device,
         )
+        if all(not request.subtalker_sampling.do_sample for request in requests):
+            return self._decode_with_official_talker(
+                requests,
+                conditions,
+                main_tokens,
+                past_length,
+            )
+
         first_codebook_hidden = self.talker.get_input_embeddings()(main_tokens)
         predictor_sequences = self._predict_secondary_codebooks(
             requests,
@@ -267,6 +283,70 @@ class NativeQwenTalkerExecutor:
             )
             token = self._choose_token(
                 logits[row : row + 1],
+                request,
+                request.sampling,
+                history=request.generated_tokens,
+                enforce_minimum=True,
+            )
+            request.next_token = token
+            request.generated_tokens.append(token)
+        return frames
+
+    def _decode_with_official_talker(
+        self,
+        requests: list[_NativeRequest],
+        conditions: list[torch.Tensor],
+        main_tokens: torch.Tensor,
+        past_length: int,
+    ) -> list[GeneratedCodecFrame]:
+        """Run Qwen's supported recurrent step as one real GPU batch.
+
+        Keeping this path inside the upstream Talker wrapper is important: it
+        remains the byte-for-byte correctness oracle for deterministic
+        generation while the scheduler owns request admission and lifecycle.
+        """
+        batch_size = len(requests)
+        outputs = self.talker(
+            input_ids=main_tokens,
+            attention_mask=torch.ones(
+                (batch_size, past_length + 1),
+                dtype=torch.long,
+                device=self.talker.device,
+            ),
+            past_key_values=_batch_caches(
+                [request.past_key_values for request in requests]
+            ),
+            cache_position=torch.tensor([past_length], device=self.talker.device),
+            past_hidden=torch.cat(
+                [request.past_hidden for request in requests], dim=0
+            ),
+            generation_step=0,
+            trailing_text_hidden=torch.cat(conditions, dim=0),
+            tts_pad_embed=torch.cat(
+                [request.prompt.text_padding_embedding for request in requests], dim=0
+            ),
+            use_cache=True,
+            output_hidden_states=True,
+            subtalker_dosample=False,
+            subtalker_top_k=50,
+            subtalker_top_p=1.0,
+            subtalker_temperature=0.9,
+        )
+        codec_codes = outputs.hidden_states[1]
+        generated_at = time.perf_counter()
+        frames: list[GeneratedCodecFrame] = []
+        for row, request in enumerate(requests):
+            request.past_key_values = _slice_cache(outputs.past_key_values, row)
+            request.past_hidden = outputs.past_hidden[row : row + 1]
+            frames.append(
+                GeneratedCodecFrame(
+                    request_id=request.request_id,
+                    codes=codec_codes[row].detach(),
+                    generated_at=generated_at,
+                )
+            )
+            token = self._choose_token(
+                outputs.logits[row : row + 1],
                 request,
                 request.sampling,
                 history=request.generated_tokens,
