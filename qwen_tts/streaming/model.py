@@ -245,6 +245,61 @@ class QwenStreamingTalkerAdapter(nn.Module):
     def _supports_logits_to_keep(self) -> bool:
         return False
 
+    def _sample_secondary_token(self, logits: torch.Tensor) -> torch.Tensor:
+        if not self.subtalker_dosample:
+            return logits.argmax(dim=-1, keepdim=True)
+
+        temperature = max(float(self.subtalker_temperature), 1e-5)
+        scores = logits.float() / temperature
+        top_k = min(max(int(self.subtalker_top_k), 0), scores.shape[-1])
+        if top_k:
+            threshold = torch.topk(scores, top_k, dim=-1).values[:, -1:]
+            scores = scores.masked_fill(scores < threshold, -torch.inf)
+        top_p = float(self.subtalker_top_p)
+        if 0.0 < top_p < 1.0:
+            sorted_scores, sorted_indices = torch.sort(scores, descending=True, dim=-1)
+            cumulative = torch.softmax(sorted_scores, dim=-1).cumsum(dim=-1)
+            remove = cumulative - torch.softmax(sorted_scores, dim=-1) >= top_p
+            sorted_scores = sorted_scores.masked_fill(remove, -torch.inf)
+            scores = torch.full_like(scores, -torch.inf).scatter(
+                dim=-1,
+                index=sorted_indices,
+                src=sorted_scores,
+            )
+        return torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1)
+
+    def _predict_secondary_codes(
+        self,
+        past_hidden: torch.Tensor,
+        first_codebook_hidden: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run Qwen's short codebook cascade without re-entering `generate()`."""
+        predictor = self.talker.code_predictor
+        inputs_embeds: torch.Tensor | None = torch.cat(
+            [past_hidden, first_codebook_hidden],
+            dim=1,
+        )
+        input_ids: torch.Tensor | None = None
+        past_key_values = None
+        generation_steps = None
+        generated: list[torch.Tensor] = []
+        for _ in range(self.config.num_code_groups - 1):
+            outputs = predictor(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                use_cache=True,
+                generation_steps=generation_steps,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            input_ids = self._sample_secondary_token(outputs.logits[:, -1, :])
+            generated.append(input_ids)
+            inputs_embeds = None
+            past_key_values = outputs.past_key_values
+            generation_steps = outputs.generation_steps
+        return torch.cat(generated, dim=-1)
+
     @torch.inference_mode()
     def forward(
         self,
@@ -297,21 +352,15 @@ class QwenStreamingTalkerAdapter(nn.Module):
                 raise RuntimeError("Qwen decode started before its prompt was prefetched")
             past_hidden = torch.cat([session.past_hidden for session in sessions], dim=0)
             first_codebook_hidden = self.talker.get_input_embeddings()(main_tokens)
-            predictor = self.talker.code_predictor.generate(
-                inputs_embeds=torch.cat([past_hidden, first_codebook_hidden], dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=self.subtalker_dosample,
-                top_k=self.subtalker_top_k,
-                top_p=self.subtalker_top_p,
-                temperature=self.subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
+            secondary_codes = self._predict_secondary_codes(
+                past_hidden,
+                first_codebook_hidden,
             )
-            codec_codes = torch.cat([main_tokens, predictor.sequences], dim=-1)
+            codec_codes = torch.cat([main_tokens, secondary_codes], dim=-1)
             codec_embeddings = [first_codebook_hidden]
             codec_embeddings.extend(
                 self.talker.code_predictor.get_input_embeddings()[index](
-                    predictor.sequences[:, index : index + 1]
+                    secondary_codes[:, index : index + 1]
                 )
                 for index in range(self.config.num_code_groups - 1)
             )
