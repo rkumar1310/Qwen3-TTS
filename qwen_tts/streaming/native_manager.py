@@ -282,6 +282,19 @@ class NativeQwenTalkerExecutor:
         inputs_embeds: torch.Tensor,
     ) -> torch.Tensor:
         predictor = self.talker.code_predictor
+        # Keep the deterministic path byte-identical to Qwen's supported
+        # generation loop. It is still one real predictor batch across all
+        # selected requests. The explicit sampler below exists for stochastic
+        # request-local generators, which Hugging Face generate() cannot accept.
+        if all(not request.subtalker_sampling.do_sample for request in requests):
+            result = predictor.generate(
+                inputs_embeds=inputs_embeds,
+                max_new_tokens=self.config.num_code_groups - 1,
+                do_sample=False,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+            return result.sequences
         output = predictor(
             inputs_embeds=inputs_embeds,
             attention_mask=torch.ones(
