@@ -25,6 +25,7 @@ class _PendingInput:
     speaker: str
     instruct_ids: torch.Tensor | None
     role_token_ids: torch.Tensor
+    max_new_tokens: int | None
     submitted: bool = False
 
 
@@ -140,6 +141,7 @@ class Qwen3TTSContinuousEngine:
         language: str = "English",
         speaker: str = "Aiden",
         instruct: str | None = None,
+        max_new_tokens: int | None = None,
     ) -> None:
         with self._lock:
             if request_id in self._inputs:
@@ -167,7 +169,12 @@ class Qwen3TTSContinuousEngine:
                 speaker=speaker,
                 instruct_ids=instruct_ids,
                 role_token_ids=role_ids,
+                max_new_tokens=max_new_tokens,
             )
+
+    def is_submitted(self, request_id: str) -> bool:
+        with self._lock:
+            return self._get(request_id).submitted
             if self.audio_decoder is not None:
                 self.audio_decoder.create_request(request_id)
 
@@ -234,6 +241,7 @@ class Qwen3TTSContinuousEngine:
             placeholder_ids,
             request_id=request_id,
             remaining_text_tokens=remaining,
+            max_new_tokens=pending.max_new_tokens,
             eos_token_id=self.qwen_model.model.config.talker_config.codec_eos_token_id,
         )
         if accepted_id is None:
