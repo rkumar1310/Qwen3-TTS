@@ -81,6 +81,7 @@ class _NativeRequest:
     next_token: int | None = None
     generated_tokens: list[int] = field(default_factory=list)
     created_at: float = field(default_factory=time.perf_counter)
+    last_scheduled_order: int = 0
 
 
 def _cache_length(cache: object) -> int:
@@ -546,6 +547,7 @@ class NativeContinuousBatchingManager:
         self._condition = Condition()
         self._thread: Thread | None = None
         self._stopping = False
+        self._schedule_order = 0
 
     def start(self) -> None:
         with self._condition:
@@ -693,10 +695,22 @@ class NativeContinuousBatchingManager:
         ]
         if not candidates:
             return [], []
-        length = _cache_length(candidates[0].past_key_values)
-        selected = [
-            request for request in candidates if _cache_length(request.past_key_values) == length
-        ][: self.max_requests_per_batch]
+        anchor = min(
+            candidates,
+            key=lambda request: (request.last_scheduled_order, request.created_at),
+        )
+        length = _cache_length(anchor.past_key_values)
+        selected = sorted(
+            (
+                request
+                for request in candidates
+                if _cache_length(request.past_key_values) == length
+            ),
+            key=lambda request: (request.last_scheduled_order, request.created_at),
+        )[: self.max_requests_per_batch]
+        self._schedule_order += 1
+        for request in selected:
+            request.last_scheduled_order = self._schedule_order
         conditions = []
         for request in selected:
             condition = self.registry.take_condition(request.request_id)
