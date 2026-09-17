@@ -219,10 +219,19 @@ class NativeQwenTalkerExecutor:
     def prefill(self, requests: list[_NativeRequest]) -> None:
         if not requests:
             return
+        had_graph_owner = self.graph_owner is not None
         self.deactivate_cuda_graph()
         prompt_length = requests[0].prompt.length
         if any(request.prompt.length != prompt_length for request in requests):
             raise ValueError("prefill batch contains different prompt lengths")
+        if (
+            len(requests) == 1
+            and not had_graph_owner
+            and self.talker_graph is not None
+            and prompt_length == self.talker_graph.prefill_length
+        ):
+            self._prefill_with_cuda_graph(requests[0])
+            return
         started_at = time.perf_counter()
         batch_size = len(requests)
         embeddings = torch.cat([request.prompt.embeddings for request in requests], dim=0)
@@ -268,6 +277,34 @@ class NativeQwenTalkerExecutor:
             "totalMs": (finished_at - started_at) * 1_000,
             "talkerMs": (cache_started_at - model_started_at) * 1_000,
             "cacheMs": (finished_at - cache_started_at) * 1_000,
+        }
+
+    def _prefill_with_cuda_graph(self, request: _NativeRequest) -> None:
+        if self.talker_graph is None:
+            raise RuntimeError("Talker CUDA graph is unavailable")
+        started_at = time.perf_counter()
+        hidden = self.talker_graph.run_prefill(request.prompt.embeddings)
+        model_finished_at = time.perf_counter()
+        logits = self.talker.codec_head(hidden)
+        request.past_key_values = self.talker_graph.static_cache
+        request.cache_length = request.prompt.length
+        request.past_hidden = hidden.clone()
+        token = self._choose_token(
+            logits,
+            request,
+            request.sampling,
+            history=request.generated_tokens,
+            enforce_minimum=True,
+        )
+        request.next_token = token
+        request.generated_tokens.append(token)
+        self.graph_owner = request
+        finished_at = time.perf_counter()
+        self.last_prefill_metrics = {
+            "totalMs": (finished_at - started_at) * 1_000,
+            "talkerMs": (model_finished_at - started_at) * 1_000,
+            "cacheMs": 0.0,
+            "cudaGraph": True,
         }
 
     def decode(
@@ -468,8 +505,7 @@ class NativeQwenTalkerExecutor:
         """Copy the graph-owned KV state back before using eager batching."""
         if self.graph_owner is None or self.talker_graph is None:
             return
-        self.talker_graph.save_dynamic_cache(
-            self.graph_owner.past_key_values,
+        self.graph_owner.past_key_values = self.talker_graph.export_dynamic_cache(
             self.graph_owner.cache_length,
         )
         self.graph_owner = None

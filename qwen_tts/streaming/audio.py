@@ -37,7 +37,7 @@ class QwenStreamingAudioDecoder:
         max_batch_size: int = 16,
         microbatch_wait_ms: float = 1.0,
         initial_chunk_frames: int = 4,
-        steady_chunk_frames: int = 8,
+        steady_chunk_frames: int = 25,
         trace_callback: TraceCallback | None = None,
     ) -> None:
         self.decoder = decoder

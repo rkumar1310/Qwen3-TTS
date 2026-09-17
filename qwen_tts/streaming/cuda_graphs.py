@@ -8,7 +8,7 @@ does not use the predictor re-prefill approximation that can alter speech.
 from __future__ import annotations
 
 import torch
-from transformers import StaticCache
+from transformers import DynamicCache, StaticCache
 
 
 def _sample_logits(
@@ -224,12 +224,14 @@ class TalkerCudaGraph:
         *,
         dtype: torch.dtype,
         max_sequence_length: int,
+        prefill_length: int = 10,
     ) -> None:
         self.model = model
         self.config = model.config
         self.device = model.device
         self.dtype = dtype
         self.max_sequence_length = int(max_sequence_length)
+        self.prefill_length = int(prefill_length)
         self.static_cache = StaticCache(
             config=self.config,
             max_cache_len=self.max_sequence_length,
@@ -242,6 +244,24 @@ class TalkerCudaGraph:
             device=self.device,
         )
         self.output_buffer = torch.zeros_like(self.input_buffer)
+        self.prefill_input_buffer = torch.zeros(
+            1,
+            self.prefill_length,
+            self.config.hidden_size,
+            dtype=dtype,
+            device=self.device,
+        )
+        self.prefill_output_buffer = torch.zeros_like(self.output_buffer)
+        self.prefill_cache_position = torch.arange(
+            self.prefill_length,
+            dtype=torch.long,
+            device=self.device,
+        )
+        self.prefill_position_ids = self.prefill_cache_position.view(1, 1, -1).expand(
+            3,
+            1,
+            -1,
+        )
         self.cache_position = torch.zeros(1, dtype=torch.long, device=self.device)
         self.position_ids = torch.zeros(3, 1, 1, dtype=torch.long, device=self.device)
         self.attention_mask = torch.zeros(
@@ -272,6 +292,13 @@ class TalkerCudaGraph:
                 torch.full((), minimum, dtype=dtype, device=self.device),
             )
         )
+        self.prefill_attention_mask = self.mask_table[: self.prefill_length].view(
+            1,
+            1,
+            self.prefill_length,
+            self.max_sequence_length,
+        )
+        self.prefill_graph: torch.cuda.CUDAGraph | None = None
         self.graph: torch.cuda.CUDAGraph | None = None
 
     def _initialize_cache(self) -> None:
@@ -311,6 +338,17 @@ class TalkerCudaGraph:
         )
         self.output_buffer.copy_(output.last_hidden_state)
 
+    def _prefill_forward(self) -> None:
+        output = self.model(
+            inputs_embeds=self.prefill_input_buffer,
+            attention_mask=self.prefill_attention_mask,
+            past_key_values=self.static_cache,
+            cache_position=self.prefill_cache_position,
+            position_ids=self.prefill_position_ids,
+            use_cache=True,
+        )
+        self.prefill_output_buffer.copy_(output.last_hidden_state[:, -1:, :])
+
     def _set_position(self, position: int) -> None:
         if position >= self.max_sequence_length:
             raise RuntimeError(
@@ -323,6 +361,24 @@ class TalkerCudaGraph:
     @torch.inference_mode()
     def capture(self, *, warmups: int = 3) -> None:
         self._initialize_cache()
+        for _ in range(warmups):
+            self.static_cache.reset()
+            self._prefill_forward()
+        torch.cuda.synchronize()
+        prefill_stream = torch.cuda.Stream()
+        prefill_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(prefill_stream):
+            self.static_cache.reset()
+            self._prefill_forward()
+            torch.cuda.synchronize()
+            self.static_cache.reset()
+            self.prefill_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.prefill_graph):
+                self._prefill_forward()
+        torch.cuda.current_stream().wait_stream(prefill_stream)
+        torch.cuda.synchronize()
+        self.static_cache.reset()
+
         self._set_position(min(100, self.max_sequence_length - 1))
         for _ in range(warmups):
             self._forward()
@@ -338,6 +394,20 @@ class TalkerCudaGraph:
         torch.cuda.current_stream().wait_stream(capture_stream)
         torch.cuda.synchronize()
         self.static_cache.reset()
+
+    @torch.inference_mode()
+    def run_prefill(self, input_embeddings: torch.Tensor) -> torch.Tensor:
+        if self.prefill_graph is None:
+            raise RuntimeError("Talker prefill CUDA graph has not been captured")
+        if input_embeddings.shape != self.prefill_input_buffer.shape:
+            raise ValueError(
+                f"Talker graph expected prompt shape {tuple(self.prefill_input_buffer.shape)}, "
+                f"got {tuple(input_embeddings.shape)}"
+            )
+        self.static_cache.reset()
+        self.prefill_input_buffer.copy_(input_embeddings)
+        self.prefill_graph.replay()
+        return self.prefill_output_buffer
 
     @torch.inference_mode()
     def load_dynamic_cache(self, dynamic_cache: object) -> int:
@@ -372,6 +442,28 @@ class TalkerCudaGraph:
                 target.keys = source.keys[:, :, :sequence_length, :].clone()
                 target.values = source.values[:, :, :sequence_length, :].clone()
             target.is_initialized = True
+
+    @torch.inference_mode()
+    def export_dynamic_cache(self, sequence_length: int) -> object:
+        """Materialize graph-owned state only when concurrency needs eager batching."""
+        try:
+            dynamic_cache = DynamicCache(config=self.config)
+        except TypeError:
+            dynamic_cache = DynamicCache()
+        for index, source in enumerate(self.static_cache.layers):
+            if not source.is_initialized:
+                continue
+            if getattr(source, "is_sliding", False):
+                keys = source.keys.clone()
+                values = source.values.clone()
+            else:
+                keys = source.keys[:, :, :sequence_length, :].clone()
+                values = source.values[:, :, :sequence_length, :].clone()
+            dynamic_cache.update(keys, values, index)
+            target = dynamic_cache.layers[index]
+            if hasattr(target, "cumulative_length"):
+                target.cumulative_length = int(sequence_length)
+        return dynamic_cache
 
     @torch.inference_mode()
     def run(self, input_embeddings: torch.Tensor, *, position: int) -> torch.Tensor:
