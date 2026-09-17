@@ -50,15 +50,6 @@ from .configuration_qwen3_tts_tokenizer_v2 import (
 logger = logging.get_logger(__name__)
 
 
-def _default_rope_parameters(config, device=None):
-    """Transformers 5 moved the default RoPE initializer off the public map."""
-    rope_parameters = getattr(config, "rope_parameters", None) or {}
-    base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
-    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim))
-    return inv_freq, 1.0
-
-
 @dataclass
 @auto_docstring
 class Qwen3TTSTokenizerV2EncoderOutput(ModelOutput):
@@ -267,11 +258,7 @@ class Qwen3TTSTokenizerV2DecoderRotatoryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = (
-            _default_rope_parameters
-            if self.rope_type == "default"
-            else ROPE_INIT_FUNCTIONS[self.rope_type]
-        )
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -349,10 +336,7 @@ class Qwen3TTSTokenizerV2DecoderAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation,
-                eager_attention_forward,
-            )
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -513,7 +497,7 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs
+    @check_model_inputs()
     @auto_docstring
     def forward(
         self,
@@ -553,8 +537,9 @@ class Qwen3TTSTokenizerV2DecoderTransformerModel(Qwen3TTSTokenizerV2DecoderPreTr
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "inputs_embeds": inputs_embeds,
+                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
+                "cache_position": cache_position,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }

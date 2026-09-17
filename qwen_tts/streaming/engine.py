@@ -6,12 +6,10 @@ from dataclasses import dataclass
 from threading import RLock
 
 import torch
-from transformers import ContinuousBatchingConfig, GenerationConfig
 
 from .audio import QwenStreamingAudioDecoder
-from .hf_manager import AppendableContinuousBatchingManager
+from .native_manager import NativeContinuousBatchingManager, NativeSamplingConfig
 from .model import (
-    QwenStreamingTalkerAdapter,
     prepare_custom_voice_prompt,
 )
 from .requests import StreamingRequestRegistry
@@ -59,7 +57,9 @@ class Qwen3TTSContinuousEngine:
     ) -> None:
         if qwen_model.model.tts_model_type != "custom_voice":
             raise ValueError("continuous engine currently requires a CustomVoice checkpoint")
+        del max_batch_tokens, max_blocks_per_request, max_memory_percent
         self.qwen_model = qwen_model
+        self.default_max_new_tokens = int(max_new_tokens)
         self.registry = StreamingRequestRegistry()
         self.audio_decoder = None
         if audio_callback is not None:
@@ -82,48 +82,29 @@ class Qwen3TTSContinuousEngine:
             if self.audio_decoder is not None:
                 self.audio_decoder.submit_frame(frame)
 
-        self.adapter = QwenStreamingTalkerAdapter(
+        self.manager = NativeContinuousBatchingManager(
             qwen_model.model.talker,
             self.registry,
-            subtalker_dosample=subtalker_dosample,
-            subtalker_top_k=subtalker_top_k,
-            subtalker_top_p=subtalker_top_p,
-            subtalker_temperature=subtalker_temperature,
-            main_attention_implementation=main_attention_implementation,
+            max_requests_per_batch=max_requests_per_batch,
+            sampling=NativeSamplingConfig(
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                repetition_penalty=repetition_penalty,
+            ),
+            subtalker_sampling=NativeSamplingConfig(
+                do_sample=subtalker_dosample,
+                top_k=subtalker_top_k,
+                top_p=subtalker_top_p,
+                temperature=subtalker_temperature,
+                repetition_penalty=1.0,
+            ),
             frame_callback=handle_frame,
         )
-        talker_config = qwen_model.model.config.talker_config
-        generation_config = GenerationConfig(
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=2,
-            do_sample=do_sample,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-            repetition_penalty=repetition_penalty,
-            eos_token_id=talker_config.codec_eos_token_id,
-            suppress_tokens=[
-                token
-                for token in range(talker_config.vocab_size - 1024, talker_config.vocab_size)
-                if token != talker_config.codec_eos_token_id
-            ],
-        )
-        batching_config = ContinuousBatchingConfig(
-            max_requests_per_batch=max_requests_per_batch,
-            max_batch_tokens=max_batch_tokens,
-            max_blocks_per_request=max_blocks_per_request,
-            max_memory_percent=max_memory_percent,
-            allow_block_sharing=False,
-            use_async_batching=False,
-            use_cuda_graph=False,
-            scheduler_type="fifo",
-        )
-        self.manager = AppendableContinuousBatchingManager(
-            self.adapter,
-            generation_config,
-            batching_config,
-            registry=self.registry,
-        )
+        # Kept in the signature so callers can roll between the old experiment
+        # and the native scheduler without changing their configuration.
+        del main_attention_implementation
         self._inputs: dict[str, _PendingInput] = {}
         self._lock = RLock()
 
@@ -194,22 +175,23 @@ class Qwen3TTSContinuousEngine:
             self._route_tokens(request_id, pending, final_tokens)
             if not pending.submitted:
                 raise ValueError("cannot synthesize an empty text stream")
-            self.manager.close_text_input(request_id)
+            self.registry.close_input(request_id)
+            self.manager.wake()
 
     def cancel_request(self, request_id: str) -> None:
         with self._lock:
             pending = self._inputs.get(request_id)
             if pending is not None and pending.submitted:
+                self.registry.cancel(request_id)
                 self.manager.cancel_request(request_id)
-                self.adapter.release_session(request_id)
             if self.audio_decoder is not None:
                 self.audio_decoder.cancel_request(request_id)
             self._inputs.pop(request_id, None)
 
     def release_request(self, request_id: str) -> None:
         with self._lock:
-            self.manager.release_streaming_request(request_id)
-            self.adapter.release_session(request_id)
+            self.manager.release_request(request_id)
+            self.registry.remove(request_id)
             self._inputs.pop(request_id, None)
 
     def finish_audio(self, request_id: str) -> None:
@@ -226,7 +208,8 @@ class Qwen3TTSContinuousEngine:
         if not token_ids:
             return
         if pending.submitted:
-            self.manager.append_text_tokens(request_id, token_ids)
+            self.registry.append(request_id, token_ids)
+            self.manager.wake()
             return
 
         first_token, remaining = token_ids[0], token_ids[1:]
@@ -238,17 +221,14 @@ class Qwen3TTSContinuousEngine:
             speaker=pending.speaker,
             instruct_ids=pending.instruct_ids,
         )
-        self.adapter.register_session(request_id, prompt)
-        placeholder_ids = [self.qwen_model.model.config.talker_config.codec_pad_id] * prompt.length
-        accepted_id = self.manager.add_streaming_request(
-            placeholder_ids,
+        self.registry.create(request_id, remaining)
+        accepted_id = self.manager.add_request(
             request_id=request_id,
-            remaining_text_tokens=remaining,
-            max_new_tokens=pending.max_new_tokens,
-            eos_token_id=self.qwen_model.model.config.talker_config.codec_eos_token_id,
+            prompt=prompt,
+            max_new_tokens=pending.max_new_tokens or self.default_max_new_tokens,
         )
         if accepted_id is None:
-            self.adapter.release_session(request_id)
+            self.registry.remove(request_id)
             raise RuntimeError("continuous batching manager rejected the Qwen request")
         pending.submitted = True
 

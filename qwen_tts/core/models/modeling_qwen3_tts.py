@@ -43,21 +43,13 @@ from transformers.processing_utils import Unpack
 from transformers.utils import can_return_tuple, logging
 from transformers.utils.hub import cached_file
 
+from ...inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
 from .configuration_qwen3_tts import (Qwen3TTSConfig,
                                       Qwen3TTSSpeakerEncoderConfig,
                                       Qwen3TTSTalkerCodePredictorConfig,
                                       Qwen3TTSTalkerConfig)
 
 logger = logging.get_logger(__name__)
-
-
-def _default_rope_parameters(config, device=None):
-    """Transformers 5 moved the default RoPE initializer off the public map."""
-    rope_parameters = getattr(config, "rope_parameters", None) or {}
-    base = rope_parameters.get("rope_theta", getattr(config, "rope_theta", 10000.0))
-    dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float, device=device) / dim))
-    return inv_freq, 1.0
 
 
 def download_weights_from_hf_specific(
@@ -543,11 +535,7 @@ class Qwen3TTSTalkerRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = (
-            _default_rope_parameters
-            if self.rope_type == "default"
-            else ROPE_INIT_FUNCTIONS[self.rope_type]
-        )
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -582,11 +570,7 @@ class Qwen3TTSRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = (
-            _default_rope_parameters
-            if self.rope_type == "default"
-            else ROPE_INIT_FUNCTIONS[self.rope_type]
-        )
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -802,10 +786,7 @@ class Qwen3TTSTalkerAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation,
-                eager_attention_forward,
-            )
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -958,10 +939,7 @@ class Qwen3TTSAttention(nn.Module):
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation,
-                eager_attention_forward,
-            )
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -1118,10 +1096,10 @@ class Qwen3TTSTalkerCodePredictorModel(Qwen3TTSPreTrainedModel):
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "inputs_embeds": inputs_embeds,
+                "input_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
+                "cache_position": cache_position,
                 "past_key_values": past_key_values,
-                "position_ids": position_ids,
             }
             # Create the masks
             causal_mask_mapping = {
@@ -1532,8 +1510,9 @@ class Qwen3TTSTalkerModel(Qwen3TTSTalkerTextPreTrainedModel):
         mask_function = create_causal_mask if self.config.sliding_window is None else create_sliding_window_causal_mask
         causal_mask = mask_function(
             config=self.config,
-            inputs_embeds=inputs_embeds,
+            input_embeds=inputs_embeds,
             attention_mask=attention_mask,
+            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
@@ -1933,8 +1912,6 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         if speech_tokenizer_path is None:
             raise ValueError(f"""{pretrained_model_name_or_path}/{speech_tokenizer_path} not exists""")
         speech_tokenizer_dir = os.path.dirname(speech_tokenizer_path)
-        from ...inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
-
         speech_tokenizer = Qwen3TTSTokenizer.from_pretrained(
             speech_tokenizer_dir,
             *model_args,
