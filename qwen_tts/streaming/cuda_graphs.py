@@ -106,7 +106,10 @@ class PredictorCudaGraph:
         )
         for layer in self.static_cache.layers:
             if not layer.is_initialized:
-                layer.lazy_initialization(dummy, dummy)
+                try:
+                    layer.lazy_initialization(dummy)
+                except TypeError:
+                    layer.lazy_initialization(dummy, dummy)
 
     def _attention_mask(
         self,
@@ -292,7 +295,10 @@ class TalkerCudaGraph:
         )
         for layer in self.static_cache.layers:
             if not layer.is_initialized:
-                layer.lazy_initialization(dummy, dummy)
+                try:
+                    layer.lazy_initialization(dummy)
+                except TypeError:
+                    layer.lazy_initialization(dummy, dummy)
 
     def _forward(self) -> None:
         output = self.model(
