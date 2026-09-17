@@ -371,7 +371,6 @@ class QwenStreamingTalkerAdapter(nn.Module):
             "cache": cache,
             "block_table": block_table,
         }
-        model_kwargs = {key: value for key, value in model_kwargs.items() if value is not None}
         outputs = self.talker.model(
             inputs_embeds=torch.cat(packed_embeddings, dim=1),
             attention_mask=attention_mask,

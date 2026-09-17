@@ -27,7 +27,12 @@ class FakeCodePredictor(nn.Module):
 
 
 class FakeMainModel(nn.Module):
-    def forward(self, *, inputs_embeds, **_kwargs):
+    def __init__(self):
+        super().__init__()
+        self.last_kwargs = {}
+
+    def forward(self, *, inputs_embeds, **kwargs):
+        self.last_kwargs = kwargs
         return SimpleNamespace(last_hidden_state=inputs_embeds + 1)
 
 
@@ -94,6 +99,8 @@ def test_prefill_then_batches_secondary_codebooks_for_two_live_requests():
 
     assert talker.code_predictor.last_batch_size == 2
     assert output.logits.shape == (1, 2, 16)
+    assert "block_table" in talker.model.last_kwargs
+    assert talker.model.last_kwargs["block_table"] is None
     assert [frame.request_id for frame in frames] == ["a", "b"]
     assert frames[0].codes.tolist() == [4, 2, 3]
     assert frames[1].codes.tolist() == [5, 2, 3]
