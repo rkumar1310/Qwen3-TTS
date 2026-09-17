@@ -474,6 +474,7 @@ class NativeQwenTalkerExecutor:
         )
         self.graph_owner = None
 
+    @torch.inference_mode()
     def release_request(self, request: _NativeRequest) -> None:
         if self.graph_owner is request:
             self.graph_owner = None
