@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from .audio import GeneratedAudioChunk, QwenStreamingAudioDecoder
     from .engine import Qwen3TTSContinuousEngine
     from .model import GeneratedCodecFrame
+    from .trace import StreamingTraceEvent
 
 __all__ = [
     "RequestAlreadyExistsError",
@@ -28,6 +29,7 @@ __all__ = [
     "StreamCondition",
     "StreamConditionKind",
     "StreamingRequestRegistry",
+    "StreamingTraceEvent",
     "TokenizationChangedError",
 ]
 
@@ -39,4 +41,6 @@ def __getattr__(name: str):
         return getattr(import_module(".engine", __name__), name)
     if name == "GeneratedCodecFrame":
         return getattr(import_module(".model", __name__), name)
+    if name == "StreamingTraceEvent":
+        return getattr(import_module(".trace", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

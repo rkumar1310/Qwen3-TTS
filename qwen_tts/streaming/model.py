@@ -41,6 +41,7 @@ class GeneratedCodecFrame:
     request_id: str
     codes: torch.Tensor
     generated_at: float
+    sequence_index: int = 0
 
 
 @dataclass

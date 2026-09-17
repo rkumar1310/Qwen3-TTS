@@ -14,6 +14,7 @@ from .model import (
 )
 from .requests import StreamingRequestRegistry
 from .text import StableTextTokenizer
+from .trace import StreamingTraceEvent, TraceCallback
 
 
 @dataclass
@@ -54,11 +55,13 @@ class Qwen3TTSContinuousEngine:
         audio_finished_callback=None,
         audio_error_callback=None,
         audio_microbatch_wait_ms: float = 1.0,
+        trace_callback: TraceCallback | None = None,
     ) -> None:
         if qwen_model.model.tts_model_type != "custom_voice":
             raise ValueError("continuous engine currently requires a CustomVoice checkpoint")
         del max_batch_tokens, max_blocks_per_request, max_memory_percent
         self.qwen_model = qwen_model
+        self.trace_callback = trace_callback
         self.default_max_new_tokens = int(max_new_tokens)
         self.registry = StreamingRequestRegistry()
         self.audio_decoder = None
@@ -74,6 +77,7 @@ class Qwen3TTSContinuousEngine:
                 error_callback=audio_error_callback,
                 max_batch_size=max_requests_per_batch,
                 microbatch_wait_ms=audio_microbatch_wait_ms,
+                trace_callback=trace_callback,
             )
 
         def handle_frame(frame):
@@ -101,6 +105,7 @@ class Qwen3TTSContinuousEngine:
                 repetition_penalty=1.0,
             ),
             frame_callback=handle_frame,
+            trace_callback=trace_callback,
         )
         # Kept in the signature so callers can roll between the old experiment
         # and the native scheduler without changing their configuration.
@@ -157,6 +162,12 @@ class Qwen3TTSContinuousEngine:
             )
             if self.audio_decoder is not None:
                 self.audio_decoder.create_request(request_id)
+            self._trace(
+                request_id,
+                "request.created",
+                language=language,
+                speaker=speaker,
+            )
 
     def is_submitted(self, request_id: str) -> bool:
         with self._lock:
@@ -166,12 +177,23 @@ class Qwen3TTSContinuousEngine:
         with self._lock:
             pending = self._get(request_id)
             token_ids = pending.tokenizer.append(delta)
+            self._trace(
+                request_id,
+                "input.delta",
+                text=delta,
+                stableTokenIds=token_ids,
+            )
             self._route_tokens(request_id, pending, token_ids)
 
     def finish_text(self, request_id: str) -> None:
         with self._lock:
             pending = self._get(request_id)
             final_tokens = pending.tokenizer.finish()
+            self._trace(
+                request_id,
+                "input.done",
+                stableTokenIds=final_tokens,
+            )
             self._route_tokens(request_id, pending, final_tokens)
             if not pending.submitted:
                 raise ValueError("cannot synthesize an empty text stream")
@@ -187,17 +209,20 @@ class Qwen3TTSContinuousEngine:
             if self.audio_decoder is not None:
                 self.audio_decoder.cancel_request(request_id)
             self._inputs.pop(request_id, None)
+            self._trace(request_id, "request.cancelled")
 
     def release_request(self, request_id: str) -> None:
         with self._lock:
             self.manager.release_request(request_id)
             self.registry.remove(request_id)
             self._inputs.pop(request_id, None)
+            self._trace(request_id, "request.released")
 
     def finish_audio(self, request_id: str) -> None:
         """Release decoder state after every queued PCM frame is emitted."""
         if self.audio_decoder is not None:
             self.audio_decoder.finish_request(request_id)
+        self._trace(request_id, "audio.finishing")
 
     def _route_tokens(
         self,
@@ -209,6 +234,7 @@ class Qwen3TTSContinuousEngine:
             return
         if pending.submitted:
             self.registry.append(request_id, token_ids)
+            self._trace(request_id, "text.tokens_queued", tokenIds=token_ids)
             self.manager.wake()
             return
 
@@ -231,6 +257,17 @@ class Qwen3TTSContinuousEngine:
             self.registry.remove(request_id)
             raise RuntimeError("continuous batching manager rejected the Qwen request")
         pending.submitted = True
+
+    def _trace(self, request_id: str, event: str, **data) -> None:
+        callback = getattr(self, "trace_callback", None)
+        if callback is not None:
+            callback(
+                StreamingTraceEvent(
+                    request_id=request_id,
+                    event=event,
+                    data=data,
+                )
+            )
 
     def _get(self, request_id: str) -> _PendingInput:
         pending = self._inputs.get(request_id)

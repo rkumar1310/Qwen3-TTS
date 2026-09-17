@@ -23,6 +23,7 @@ import torch
 
 from .model import GeneratedCodecFrame, PreparedStreamingPrompt
 from .requests import StreamConditionKind, StreamingRequestRegistry
+from .trace import StreamingTraceEvent, TraceCallback
 
 
 class NativeRequestStatus(str, Enum):
@@ -169,6 +170,8 @@ class NativeQwenTalkerExecutor:
             device=talker.device,
             dtype=torch.long,
         )
+        self.last_prefill_metrics: dict[str, float] = {}
+        self.last_decode_metrics: dict[str, float] = {}
 
     def prefill(self, requests: list[_NativeRequest]) -> None:
         if not requests:
@@ -176,8 +179,10 @@ class NativeQwenTalkerExecutor:
         prompt_length = requests[0].prompt.length
         if any(request.prompt.length != prompt_length for request in requests):
             raise ValueError("prefill batch contains different prompt lengths")
+        started_at = time.perf_counter()
         batch_size = len(requests)
         embeddings = torch.cat([request.prompt.embeddings for request in requests], dim=0)
+        model_started_at = time.perf_counter()
         outputs = self.talker(
             inputs_embeds=embeddings,
             attention_mask=torch.ones(
@@ -200,6 +205,7 @@ class NativeQwenTalkerExecutor:
             subtalker_temperature=0.9,
         )
         logits = outputs.logits
+        cache_started_at = time.perf_counter()
         for row, request in enumerate(requests):
             request.past_key_values = _slice_cache(outputs.past_key_values, row)
             request.past_hidden = outputs.past_hidden[row : row + 1]
@@ -212,6 +218,12 @@ class NativeQwenTalkerExecutor:
             )
             request.next_token = token
             request.generated_tokens.append(token)
+        finished_at = time.perf_counter()
+        self.last_prefill_metrics = {
+            "totalMs": (finished_at - started_at) * 1_000,
+            "talkerMs": (cache_started_at - model_started_at) * 1_000,
+            "cacheMs": (finished_at - cache_started_at) * 1_000,
+        }
 
     def decode(
         self,
@@ -241,7 +253,9 @@ class NativeQwenTalkerExecutor:
                 past_length,
             )
 
+        started_at = time.perf_counter()
         first_codebook_hidden = self.talker.get_input_embeddings()(main_tokens)
+        predictor_started_at = time.perf_counter()
         predictor_sequences = self._predict_secondary_codebooks(
             requests,
             torch.cat(
@@ -252,6 +266,7 @@ class NativeQwenTalkerExecutor:
                 dim=1,
             ),
         )
+        predictor_finished_at = time.perf_counter()
         codec_codes = torch.cat([main_tokens, predictor_sequences], dim=1)
         codec_embeddings = [first_codebook_hidden]
         codec_embeddings.extend(
@@ -262,7 +277,9 @@ class NativeQwenTalkerExecutor:
         )
         acoustic_embedding = torch.cat(codec_embeddings, dim=1).sum(dim=1, keepdim=True)
         inputs_embeds = acoustic_embedding + torch.cat(conditions, dim=0)
+        cache_started_at = time.perf_counter()
         batched_cache = _batch_caches([request.past_key_values for request in requests])
+        cache_finished_at = time.perf_counter()
         batch_size = len(requests)
         position_ids = torch.full(
             (3, batch_size, 1),
@@ -270,6 +287,7 @@ class NativeQwenTalkerExecutor:
             dtype=torch.long,
             device=self.talker.device,
         )
+        talker_started_at = time.perf_counter()
         outputs = self.talker.model(
             inputs_embeds=inputs_embeds,
             attention_mask=torch.ones(
@@ -293,6 +311,7 @@ class NativeQwenTalkerExecutor:
                     request_id=request.request_id,
                     codes=codec_codes[row].detach(),
                     generated_at=generated_at,
+                    sequence_index=len(request.generated_tokens) - 1,
                 )
             )
             token = self._choose_token(
@@ -304,6 +323,13 @@ class NativeQwenTalkerExecutor:
             )
             request.next_token = token
             request.generated_tokens.append(token)
+        finished_at = time.perf_counter()
+        self.last_decode_metrics = {
+            "totalMs": (finished_at - started_at) * 1_000,
+            "predictorMs": (predictor_finished_at - predictor_started_at) * 1_000,
+            "cacheMs": (cache_finished_at - cache_started_at) * 1_000,
+            "talkerMs": (finished_at - talker_started_at) * 1_000,
+        }
         return frames
 
     def _decode_with_official_talker(
@@ -319,7 +345,14 @@ class NativeQwenTalkerExecutor:
         remains the byte-for-byte correctness oracle for deterministic
         generation while the scheduler owns request admission and lifecycle.
         """
+        started_at = time.perf_counter()
         batch_size = len(requests)
+        cache_started_at = time.perf_counter()
+        batched_cache = _batch_caches(
+            [request.past_key_values for request in requests]
+        )
+        cache_finished_at = time.perf_counter()
+        talker_started_at = time.perf_counter()
         outputs = self.talker(
             input_ids=main_tokens,
             attention_mask=torch.ones(
@@ -327,9 +360,7 @@ class NativeQwenTalkerExecutor:
                 dtype=torch.long,
                 device=self.talker.device,
             ),
-            past_key_values=_batch_caches(
-                [request.past_key_values for request in requests]
-            ),
+            past_key_values=batched_cache,
             cache_position=torch.tensor([past_length], device=self.talker.device),
             past_hidden=torch.cat(
                 [request.past_hidden for request in requests], dim=0
@@ -357,6 +388,7 @@ class NativeQwenTalkerExecutor:
                     request_id=request.request_id,
                     codes=codec_codes[row].detach(),
                     generated_at=generated_at,
+                    sequence_index=len(request.generated_tokens) - 1,
                 )
             )
             token = self._choose_token(
@@ -368,6 +400,13 @@ class NativeQwenTalkerExecutor:
             )
             request.next_token = token
             request.generated_tokens.append(token)
+        finished_at = time.perf_counter()
+        self.last_decode_metrics = {
+            "totalMs": (finished_at - started_at) * 1_000,
+            "predictorMs": 0.0,
+            "cacheMs": (cache_finished_at - cache_started_at) * 1_000,
+            "talkerMs": (finished_at - talker_started_at) * 1_000,
+        }
         return frames
 
     def _predict_secondary_codebooks(
@@ -492,6 +531,7 @@ class NativeContinuousBatchingManager:
         sampling: NativeSamplingConfig,
         subtalker_sampling: NativeSamplingConfig,
         frame_callback: Callable[[GeneratedCodecFrame], None] | None = None,
+        trace_callback: TraceCallback | None = None,
     ) -> None:
         self.registry = registry
         self.executor = NativeQwenTalkerExecutor(talker)
@@ -499,6 +539,7 @@ class NativeContinuousBatchingManager:
         self.default_sampling = sampling
         self.default_subtalker_sampling = subtalker_sampling
         self.frame_callback = frame_callback
+        self.trace_callback = trace_callback
         self.background_thread_status = NativeBackgroundThreadStatus()
         self._requests: dict[str, _NativeRequest] = {}
         self._results: dict[str, deque[NativeGenerationResult]] = defaultdict(deque)
@@ -546,6 +587,17 @@ class NativeContinuousBatchingManager:
                 subtalker_sampling=self.default_subtalker_sampling,
                 generator=generator,
             )
+            self._trace(
+                request_id,
+                "scheduler.admitted",
+                maxNewTokens=int(max_new_tokens),
+                promptTokens=prompt.length,
+            )
+            self._trace(
+                request_id,
+                "request.state",
+                state=NativeRequestStatus.PREFILLING.value,
+            )
             self._condition.notify_all()
         return request_id
 
@@ -558,7 +610,7 @@ class NativeContinuousBatchingManager:
             request = self._requests.get(request_id)
             if request is None or request.status in _TERMINAL_STATUSES:
                 return
-            request.status = NativeRequestStatus.CANCELLED
+            self._set_status(request, NativeRequestStatus.CANCELLED)
             self._publish_locked(request)
             self._condition.notify_all()
 
@@ -599,7 +651,11 @@ class NativeContinuousBatchingManager:
                 self.background_thread_status.fatal_error = error
                 for request in self._requests.values():
                     if request.status not in _TERMINAL_STATUSES:
-                        request.status = NativeRequestStatus.FAILED
+                        self._set_status(
+                            request,
+                            NativeRequestStatus.FAILED,
+                            error=str(error),
+                        )
                         self._publish_locked(request, error=str(error))
                 self._condition.notify_all()
 
@@ -659,24 +715,39 @@ class NativeContinuousBatchingManager:
                 conditions.append(request.prompt.text_end_embedding)
             else:
                 conditions.append(request.prompt.text_padding_embedding)
-            request.status = NativeRequestStatus.DECODING
+            self._trace(
+                request.request_id,
+                "text.condition",
+                kind=condition.kind.value,
+                tokenId=condition.token_id,
+            )
+            self._set_status(request, NativeRequestStatus.DECODING)
         return selected, conditions
 
     def _run_prefill(self, requests: list[_NativeRequest]) -> None:
         try:
             with torch.inference_mode():
                 self.executor.prefill(requests)
+            request_ids = [request.request_id for request in requests]
+            for request in requests:
+                self._trace(
+                    request.request_id,
+                    "model.prefill",
+                    requestIds=request_ids,
+                    batchSize=len(requests),
+                    **self.executor.last_prefill_metrics,
+                )
             with self._condition:
                 for request in requests:
                     if request.status == NativeRequestStatus.CANCELLED:
                         continue
                     if request.next_token == self.executor.eos_token_id:
-                        request.status = NativeRequestStatus.COMPLETED
+                        self._set_status(request, NativeRequestStatus.COMPLETED)
                         self._publish_locked(request)
                     elif self.registry.can_decode(request.request_id):
-                        request.status = NativeRequestStatus.DECODING
+                        self._set_status(request, NativeRequestStatus.DECODING)
                     else:
-                        request.status = NativeRequestStatus.WAITING_FOR_TEXT
+                        self._set_status(request, NativeRequestStatus.WAITING_FOR_TEXT)
                 self._condition.notify_all()
         except Exception as error:
             self._fail_requests(requests, error)
@@ -689,6 +760,22 @@ class NativeContinuousBatchingManager:
         try:
             with torch.inference_mode():
                 frames = self.executor.decode(requests, conditions)
+            request_ids = [request.request_id for request in requests]
+            for request in requests:
+                self._trace(
+                    request.request_id,
+                    "model.step",
+                    requestIds=request_ids,
+                    batchSize=len(requests),
+                    **self.executor.last_decode_metrics,
+                )
+            for frame in frames:
+                self._trace(
+                    frame.request_id,
+                    "codec.frame",
+                    sequence=frame.sequence_index,
+                    codes=[int(code) for code in frame.codes.tolist()],
+                )
             if self.frame_callback is not None:
                 for frame in frames:
                     self.frame_callback(frame)
@@ -699,12 +786,12 @@ class NativeContinuousBatchingManager:
                     reached_eos = request.next_token == self.executor.eos_token_id
                     reached_limit = len(request.generated_tokens) >= request.max_new_tokens
                     if reached_eos or reached_limit:
-                        request.status = NativeRequestStatus.COMPLETED
+                        self._set_status(request, NativeRequestStatus.COMPLETED)
                         self._publish_locked(request)
                     elif self.registry.can_decode(request.request_id):
-                        request.status = NativeRequestStatus.DECODING
+                        self._set_status(request, NativeRequestStatus.DECODING)
                     else:
-                        request.status = NativeRequestStatus.WAITING_FOR_TEXT
+                        self._set_status(request, NativeRequestStatus.WAITING_FOR_TEXT)
                 self._condition.notify_all()
         except Exception as error:
             self._fail_requests(requests, error)
@@ -713,7 +800,7 @@ class NativeContinuousBatchingManager:
         with self._condition:
             for request in requests:
                 if request.status not in _TERMINAL_STATUSES:
-                    request.status = NativeRequestStatus.FAILED
+                    self._set_status(request, NativeRequestStatus.FAILED, error=str(error))
                     self._publish_locked(request, error=str(error))
             self._condition.notify_all()
 
@@ -727,3 +814,31 @@ class NativeContinuousBatchingManager:
             )
         )
         self._condition.notify_all()
+
+    def _set_status(
+        self,
+        request: _NativeRequest,
+        status: NativeRequestStatus,
+        **data,
+    ) -> None:
+        if request.status == status:
+            return
+        previous = request.status
+        request.status = status
+        self._trace(
+            request.request_id,
+            "request.state",
+            previous=previous.value,
+            state=status.value,
+            **data,
+        )
+
+    def _trace(self, request_id: str, event: str, **data) -> None:
+        if self.trace_callback is not None:
+            self.trace_callback(
+                StreamingTraceEvent(
+                    request_id=request_id,
+                    event=event,
+                    data=data,
+                )
+            )

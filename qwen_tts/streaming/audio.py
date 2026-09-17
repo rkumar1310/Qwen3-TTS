@@ -11,6 +11,7 @@ from typing import Callable
 import torch
 
 from .model import GeneratedCodecFrame
+from .trace import StreamingTraceEvent, TraceCallback
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class QwenStreamingAudioDecoder:
         error_callback: Callable[[str, Exception], None] | None = None,
         max_batch_size: int = 16,
         microbatch_wait_ms: float = 1.0,
+        trace_callback: TraceCallback | None = None,
     ) -> None:
         self.decoder = decoder
         self.sample_rate = int(sample_rate)
@@ -43,10 +45,12 @@ class QwenStreamingAudioDecoder:
         self.error_callback = error_callback
         self.max_batch_size = int(max_batch_size)
         self.microbatch_wait_seconds = max(0.0, microbatch_wait_ms / 1000.0)
+        self.trace_callback = trace_callback
         self._queue: deque[GeneratedCodecFrame] = deque()
         self._caches: dict[str, dict] = {}
         self._closing: set[str] = set()
         self._cancelled: set[str] = set()
+        self._sequences: dict[str, int] = {}
         self._condition = Condition()
         self._thread: Thread | None = None
         self._stopping = False
@@ -76,6 +80,7 @@ class QwenStreamingAudioDecoder:
             if request_id in self._caches:
                 raise ValueError(f"audio decoder request {request_id!r} already exists")
             self._caches[request_id] = {}
+            self._sequences[request_id] = 0
             self._closing.discard(request_id)
             self._cancelled.discard(request_id)
 
@@ -101,6 +106,8 @@ class QwenStreamingAudioDecoder:
             self._closing.discard(request_id)
             self._caches.pop(request_id, None)
             self._queue = deque(frame for frame in self._queue if frame.request_id != request_id)
+            self._sequences.pop(request_id, None)
+            self._trace(request_id, "audio.cancelled")
             self._condition.notify_all()
 
     def _run(self) -> None:
@@ -120,11 +127,13 @@ class QwenStreamingAudioDecoder:
                 continue
             request_ids = [frame.request_id for frame in frames]
             try:
+                batch_started_at = time.perf_counter()
                 device = next(self.decoder.parameters()).device
                 codes = torch.stack([frame.codes.to(device=device) for frame in frames], dim=0)
                 if codes.ndim == 2:
                     codes = codes.unsqueeze(-1)
                 caches = [self._caches[request_id] for request_id in request_ids]
+                decoder_started_at = time.perf_counter()
                 with torch.inference_mode():
                     waveforms = self.decoder.batched_chunked_decode(
                         codes,
@@ -132,12 +141,36 @@ class QwenStreamingAudioDecoder:
                         caches,
                         max_batch_size=self.max_batch_size,
                     )
+                decoder_finished_at = time.perf_counter()
+                cpu_waveforms = [
+                    waveform.reshape(-1).to(dtype=torch.float32).detach().cpu()
+                    for waveform in waveforms
+                ]
                 decoded_at = time.perf_counter()
-                for frame, waveform in zip(frames, waveforms, strict=True):
+                for frame, pcm in zip(frames, cpu_waveforms, strict=True):
+                    sequence = self._sequences.get(frame.request_id, 0)
+                    self._trace(
+                        frame.request_id,
+                        "audio.decode",
+                        requestIds=request_ids,
+                        batchSize=len(frames),
+                        decoderMs=(decoder_finished_at - decoder_started_at) * 1_000,
+                        gpuToCpuMs=(decoded_at - decoder_finished_at) * 1_000,
+                        totalMs=(decoded_at - batch_started_at) * 1_000,
+                    )
+                    self._trace(
+                        frame.request_id,
+                        "pcm.chunk",
+                        sequence=sequence,
+                        samples=int(pcm.numel()),
+                        sampleRate=self.sample_rate,
+                        codecToPcmMs=(decoded_at - frame.generated_at) * 1_000,
+                    )
+                    self._sequences[frame.request_id] = sequence + 1
                     self.chunk_callback(
                         GeneratedAudioChunk(
                             request_id=frame.request_id,
-                            pcm=waveform.reshape(-1).to(dtype=torch.float32).detach().cpu(),
+                            pcm=pcm,
                             sample_rate=self.sample_rate,
                             generated_at=frame.generated_at,
                             decoded_at=decoded_at,
@@ -174,7 +207,18 @@ class QwenStreamingAudioDecoder:
         for request_id in finished:
             self._closing.remove(request_id)
             self._caches.pop(request_id, None)
+            self._sequences.pop(request_id, None)
+            self._trace(request_id, "audio.released")
         if self.request_finished_callback is not None:
             for request_id in finished:
                 self.request_finished_callback(request_id)
 
+    def _trace(self, request_id: str, event: str, **data) -> None:
+        if self.trace_callback is not None:
+            self.trace_callback(
+                StreamingTraceEvent(
+                    request_id=request_id,
+                    event=event,
+                    data=data,
+                )
+            )
