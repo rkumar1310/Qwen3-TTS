@@ -98,22 +98,7 @@ class QwenStreamingAudioDecoder:
             if frame.request_id not in self._caches:
                 raise KeyError(frame.request_id)
             self._queue.append(frame)
-            prioritize_first_chunk = (
-                len(self._caches) == 1
-                and self._sequences.get(frame.request_id, 0) == 0
-                and sum(
-                    queued.request_id == frame.request_id for queued in self._queue
-                )
-                >= self.initial_chunk_frames
-            )
-            self._condition.notify_all()
-            if prioritize_first_chunk:
-                self._condition.wait_for(
-                    lambda: self._sequences.get(frame.request_id, 0) > 0
-                    or frame.request_id in self._cancelled
-                    or self._stopping,
-                    timeout=2.0,
-                )
+            self._condition.notify()
 
     def finish_request(self, request_id: str) -> None:
         with self._condition:
@@ -224,7 +209,6 @@ class QwenStreamingAudioDecoder:
             finally:
                 with self._condition:
                     self._finish_drained_requests_locked()
-                    self._condition.notify_all()
 
     def _take_batch_locked(self) -> list[list[GeneratedCodecFrame]]:
         """Take several frames per request to amortize the expensive vocoder call."""
