@@ -92,3 +92,40 @@ def test_audio_decoder_buffers_a_small_first_chunk_then_larger_steady_chunks():
 
     assert decoder.frame_lengths == [[4], [8]]
     assert [chunk.pcm.numel() for chunk in chunks] == [16, 32]
+
+
+def test_audio_decoder_ramps_to_the_steady_chunk_without_starving_playback():
+    decoder = FakeDecoder()
+    chunks = []
+    done = Event()
+
+    def on_chunk(chunk):
+        chunks.append(chunk)
+        if len(chunks) == 4:
+            done.set()
+
+    worker = QwenStreamingAudioDecoder(
+        decoder,
+        sample_rate=24_000,
+        chunk_callback=on_chunk,
+        initial_chunk_frames=4,
+        steady_chunk_frames=25,
+    )
+    worker.create_request("turn")
+    worker.start()
+    now = time.perf_counter()
+    for sequence in range(53):
+        worker.submit_frame(
+            GeneratedCodecFrame(
+                "turn",
+                torch.tensor([sequence, sequence + 1]),
+                now + sequence / 12,
+                sequence,
+            )
+        )
+
+    assert done.wait(2)
+    worker.finish_request("turn")
+    worker.stop()
+
+    assert decoder.frame_lengths == [[4], [8], [16], [25]]
