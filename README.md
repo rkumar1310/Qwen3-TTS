@@ -1,5 +1,7 @@
 # Qwen3-TTS
 
+> Experimental: the fork's [native continuous text-streaming runtime](docs/continuous-streaming.md) keeps one Qwen speech request and one vocoder state alive across incoming text deltas, with paged request batching and stateful codec-to-PCM decoding.
+
 <br>
 
 <p align="center">

@@ -13,6 +13,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from .configuration_qwen3_tts import Qwen3TTSConfig
-from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
-from .processing_qwen3_tts import Qwen3TTSProcessor
+__all__ = [
+    "Qwen3TTSConfig",
+    "Qwen3TTSForConditionalGeneration",
+    "Qwen3TTSProcessor",
+]
+
+
+def __getattr__(name):
+    if name == "Qwen3TTSConfig":
+        from .configuration_qwen3_tts import Qwen3TTSConfig
+
+        return Qwen3TTSConfig
+    if name == "Qwen3TTSForConditionalGeneration":
+        from .modeling_qwen3_tts import Qwen3TTSForConditionalGeneration
+
+        return Qwen3TTSForConditionalGeneration
+    if name == "Qwen3TTSProcessor":
+        from .processing_qwen3_tts import Qwen3TTSProcessor
+
+        return Qwen3TTSProcessor
+    raise AttributeError(name)

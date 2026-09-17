@@ -14,11 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-qwen_tts: Qwen-TTS package.
-"""
+"""qwen_tts: Qwen-TTS package."""
 
-from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
-from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+from importlib import import_module
+from typing import TYPE_CHECKING
 
-__all__ = ["__version__"]
+
+if TYPE_CHECKING:
+    from .inference.qwen3_tts_model import Qwen3TTSModel, VoiceClonePromptItem
+    from .inference.qwen3_tts_tokenizer import Qwen3TTSTokenizer
+
+__all__ = ["Qwen3TTSModel", "Qwen3TTSTokenizer", "VoiceClonePromptItem"]
+
+
+def __getattr__(name: str):
+    """Load the heavyweight audio inference dependencies only when requested."""
+    if name in {"Qwen3TTSModel", "VoiceClonePromptItem"}:
+        module = import_module(".inference.qwen3_tts_model", __name__)
+        return getattr(module, name)
+    if name == "Qwen3TTSTokenizer":
+        module = import_module(".inference.qwen3_tts_tokenizer", __name__)
+        return getattr(module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
