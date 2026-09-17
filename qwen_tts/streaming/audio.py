@@ -38,6 +38,7 @@ class QwenStreamingAudioDecoder:
         microbatch_wait_ms: float = 1.0,
         initial_chunk_frames: int = 4,
         steady_chunk_frames: int = 25,
+        idle_flush_ms: float = 100.0,
         trace_callback: TraceCallback | None = None,
     ) -> None:
         self.decoder = decoder
@@ -52,12 +53,14 @@ class QwenStreamingAudioDecoder:
             self.initial_chunk_frames,
             int(steady_chunk_frames),
         )
+        self.idle_flush_seconds = max(0.0, float(idle_flush_ms) / 1_000.0)
         self.trace_callback = trace_callback
         self._queue: deque[GeneratedCodecFrame] = deque()
         self._caches: dict[str, dict] = {}
         self._closing: set[str] = set()
         self._cancelled: set[str] = set()
         self._sequences: dict[str, int] = {}
+        self._last_submitted_at: dict[str, float] = {}
         self._condition = Condition()
         self._thread: Thread | None = None
         self._stopping = False
@@ -88,6 +91,7 @@ class QwenStreamingAudioDecoder:
                 raise ValueError(f"audio decoder request {request_id!r} already exists")
             self._caches[request_id] = {}
             self._sequences[request_id] = 0
+            self._last_submitted_at.pop(request_id, None)
             self._closing.discard(request_id)
             self._cancelled.discard(request_id)
 
@@ -98,6 +102,7 @@ class QwenStreamingAudioDecoder:
             if frame.request_id not in self._caches:
                 raise KeyError(frame.request_id)
             self._queue.append(frame)
+            self._last_submitted_at[frame.request_id] = time.perf_counter()
             self._condition.notify()
 
     def finish_request(self, request_id: str) -> None:
@@ -114,6 +119,7 @@ class QwenStreamingAudioDecoder:
             self._caches.pop(request_id, None)
             self._queue = deque(frame for frame in self._queue if frame.request_id != request_id)
             self._sequences.pop(request_id, None)
+            self._last_submitted_at.pop(request_id, None)
             self._trace(request_id, "audio.cancelled")
             self._condition.notify_all()
 
@@ -239,6 +245,12 @@ class QwenStreamingAudioDecoder:
                 selected_counts[request_id] = target
             elif (request_id in self._closing or self._stopping) and count:
                 selected_counts[request_id] = count
+            elif (
+                count
+                and time.perf_counter() - self._last_submitted_at.get(request_id, 0.0)
+                >= self.idle_flush_seconds
+            ):
+                selected_counts[request_id] = count
 
         if not selected_counts:
             return []
@@ -261,6 +273,7 @@ class QwenStreamingAudioDecoder:
             self._closing.remove(request_id)
             self._caches.pop(request_id, None)
             self._sequences.pop(request_id, None)
+            self._last_submitted_at.pop(request_id, None)
             self._trace(request_id, "audio.released")
         if self.request_finished_callback is not None:
             for request_id in finished:

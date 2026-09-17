@@ -57,6 +57,7 @@ class Qwen3TTSContinuousEngine:
         audio_microbatch_wait_ms: float = 1.0,
         audio_initial_chunk_frames: int = 4,
         audio_steady_chunk_frames: int = 25,
+        audio_idle_flush_ms: float = 100.0,
         enable_cuda_graphs: bool = True,
         cuda_graph_max_sequence_length: int = 2_048,
         trace_callback: TraceCallback | None = None,
@@ -83,6 +84,7 @@ class Qwen3TTSContinuousEngine:
                 microbatch_wait_ms=audio_microbatch_wait_ms,
                 initial_chunk_frames=audio_initial_chunk_frames,
                 steady_chunk_frames=audio_steady_chunk_frames,
+                idle_flush_ms=audio_idle_flush_ms,
                 trace_callback=trace_callback,
             )
 

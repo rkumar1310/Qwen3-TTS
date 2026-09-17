@@ -129,3 +129,29 @@ def test_audio_decoder_ramps_to_the_steady_chunk_without_starving_playback():
     worker.stop()
 
     assert decoder.frame_lengths == [[4], [8], [16], [25]]
+
+
+def test_audio_decoder_flushes_a_partial_packet_when_generation_pauses():
+    decoder = FakeDecoder()
+    chunks = []
+    received = Event()
+    worker = QwenStreamingAudioDecoder(
+        decoder,
+        sample_rate=24_000,
+        chunk_callback=lambda chunk: (chunks.append(chunk), received.set()),
+        initial_chunk_frames=4,
+        steady_chunk_frames=25,
+        idle_flush_ms=20,
+    )
+    worker.create_request("turn")
+    worker.start()
+    worker.submit_frame(
+        GeneratedCodecFrame("turn", torch.tensor([1, 2]), time.perf_counter(), 0)
+    )
+
+    assert received.wait(1)
+    worker.finish_request("turn")
+    worker.stop()
+
+    assert decoder.frame_lengths == [[1]]
+    assert len(chunks) == 1
