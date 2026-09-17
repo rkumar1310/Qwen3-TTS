@@ -20,24 +20,10 @@ class FakeCodePredictor(nn.Module):
     def get_input_embeddings(self):
         return self.embeddings
 
-    def forward(
-        self,
-        *,
-        input_ids=None,
-        inputs_embeds=None,
-        generation_steps=None,
-        **_kwargs,
-    ):
-        batch = inputs_embeds.shape[0] if inputs_embeds is not None else input_ids.shape[0]
-        self.last_batch_size = batch
-        step = 0 if generation_steps is None else generation_steps
-        logits = torch.full((batch, 1, 16), -100.0)
-        logits[:, :, 2 + step] = 100.0
-        return SimpleNamespace(
-            logits=logits,
-            past_key_values=None,
-            generation_steps=step + 1,
-        )
+    def generate(self, *, inputs_embeds, **_kwargs):
+        self.last_batch_size = inputs_embeds.shape[0]
+        sequences = torch.tensor([[2, 3]], dtype=torch.long).repeat(self.last_batch_size, 1)
+        return SimpleNamespace(sequences=sequences)
 
 
 class FakeMainModel(nn.Module):
