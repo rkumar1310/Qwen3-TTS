@@ -30,6 +30,10 @@ class FakeMainModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.last_kwargs = {}
+        self.attention_implementation = None
+
+    def set_attn_implementation(self, value):
+        self.attention_implementation = value
 
     def forward(self, *, inputs_embeds, **kwargs):
         self.last_kwargs = kwargs
@@ -106,3 +110,20 @@ def test_prefill_then_batches_secondary_codebooks_for_two_live_requests():
     assert frames[1].codes.tolist() == [5, 2, 3]
     assert not registry.can_decode("a")
     assert not registry.can_decode("b")
+
+
+def test_attention_override_keeps_secondary_predictor_on_standard_attention():
+    talker = FakeTalker()
+    talker.code_predictor.config = SimpleNamespace(_attn_implementation="sdpa")
+    adapter = QwenStreamingTalkerAdapter(
+        talker,
+        StreamingRequestRegistry(),
+        main_attention_implementation="paged|sdpa",
+    )
+
+    adapter.set_attn_implementation("paged|flash_attention_2")
+
+    assert talker.model.attention_implementation == {
+        "": "paged|sdpa",
+        "code_predictor_config": "sdpa",
+    }

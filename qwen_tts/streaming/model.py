@@ -173,6 +173,7 @@ class QwenStreamingTalkerAdapter(nn.Module):
         subtalker_top_k: int = 50,
         subtalker_top_p: float = 1.0,
         subtalker_temperature: float = 0.9,
+        main_attention_implementation: str | None = None,
         frame_callback: Callable[[GeneratedCodecFrame], None] | None = None,
     ) -> None:
         super().__init__()
@@ -183,6 +184,7 @@ class QwenStreamingTalkerAdapter(nn.Module):
         self.subtalker_top_k = subtalker_top_k
         self.subtalker_top_p = subtalker_top_p
         self.subtalker_temperature = subtalker_temperature
+        self.main_attention_implementation = main_attention_implementation
         self.frame_callback = frame_callback
         self._sessions: dict[str, _ModelSession] = {}
         self._batch_context: list[BatchRequestContext] | None = None
@@ -207,7 +209,7 @@ class QwenStreamingTalkerAdapter(nn.Module):
         # a normal short batched generation and must keep ordinary attention.
         self.talker.model.set_attn_implementation(
             {
-                "": implementation,
+                "": self.main_attention_implementation or implementation,
                 "code_predictor_config": self.talker.code_predictor.config._attn_implementation,
             }
         )

@@ -50,6 +50,7 @@ class Qwen3TTSContinuousEngine:
         subtalker_top_k: int = 50,
         subtalker_top_p: float = 1.0,
         subtalker_temperature: float = 0.9,
+        main_attention_implementation: str | None = None,
         frame_callback=None,
         audio_callback=None,
         audio_finished_callback=None,
@@ -88,6 +89,7 @@ class Qwen3TTSContinuousEngine:
             subtalker_top_k=subtalker_top_k,
             subtalker_top_p=subtalker_top_p,
             subtalker_temperature=subtalker_temperature,
+            main_attention_implementation=main_attention_implementation,
             frame_callback=handle_frame,
         )
         talker_config = qwen_model.model.config.talker_config
