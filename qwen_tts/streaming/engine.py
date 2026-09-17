@@ -93,6 +93,7 @@ class Qwen3TTSContinuousEngine:
         talker_config = qwen_model.model.config.talker_config
         generation_config = GenerationConfig(
             max_new_tokens=max_new_tokens,
+            min_new_tokens=2,
             do_sample=do_sample,
             top_k=top_k,
             top_p=top_p,
