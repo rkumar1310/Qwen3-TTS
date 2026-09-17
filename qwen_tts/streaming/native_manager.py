@@ -90,6 +90,8 @@ def _batch_caches(caches: list[object]) -> object:
     """Stack same-length DynamicCache objects along their batch dimension."""
     if not caches:
         raise ValueError("cannot batch an empty cache list")
+    if len(caches) == 1:
+        return caches[0]
     batched = copy.deepcopy(caches[0])
     if hasattr(batched, "layers"):
         for output_layer, input_layers in zip(
@@ -124,6 +126,18 @@ def _batch_caches(caches: list[object]) -> object:
 
 def _slice_cache(cache: object, row: int) -> object:
     """Detach one request row from a batched DynamicCache."""
+    if row == 0:
+        if hasattr(cache, "layers"):
+            populated = next(
+                (layer.keys for layer in cache.layers if layer.keys is not None),
+                None,
+            )
+            if populated is None or populated.shape[0] == 1:
+                return cache
+        elif hasattr(cache, "key_cache"):
+            populated = next((tensor for tensor in cache.key_cache if tensor is not None), None)
+            if populated is None or populated.shape[0] == 1:
+                return cache
     result = copy.deepcopy(cache)
     if hasattr(result, "layers"):
         for layer in result.layers:
